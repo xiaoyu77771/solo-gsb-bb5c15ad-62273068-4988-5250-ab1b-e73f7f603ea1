@@ -1,7 +1,7 @@
 """请求/响应模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ReconcileRequest(BaseModel):
@@ -76,3 +76,81 @@ class AnchoredColumn(Column):
 
 class AnchoredReconcileResponse(ReconcileResponse):
     columns: list[AnchoredColumn] = Field(..., description="对齐列(含 anchored 标记)")
+
+
+class Decision(BaseModel):
+    """一项人工裁决:以三来源原始位置签名定位一个 uncertain 列并给出采用值。"""
+
+    signature: list[int | None] = Field(
+        ...,
+        description=(
+            "三来源原始位置签名,依次为该列在 texts[0/1/2] 中的字素簇下标;"
+            "该列未消费的来源记为 null(与 uncertain 列 sources 中的 position 一致)"
+        ),
+    )
+    source: int | None = Field(
+        default=None, description="采用某个非空来源字素:来源下标 0/1/2;与 replacement 二选一"
+    )
+    replacement: str | None = Field(
+        default=None, description="提供恰好一个 NFC 字素簇作为替换值;与 source 二选一"
+    )
+
+    @field_validator("signature")
+    @classmethod
+    def _signature_shape(cls, v: list) -> list:
+        if len(v) != 3:
+            raise ValueError("signature 必须恰好给出三个位置(长度须为 3,空位为 null)")
+        for pos in v:
+            if pos is not None and pos < 0:
+                raise ValueError("signature 中的位置不得为负")
+        return v
+
+    @field_validator("source")
+    @classmethod
+    def _source_range(cls, v: int | None) -> int | None:
+        if v is not None and v not in (0, 1, 2):
+            raise ValueError("source 必须是 0、1 或 2")
+        return v
+
+    @field_validator("replacement")
+    @classmethod
+    def _replacement_non_empty(cls, v: str | None) -> str | None:
+        if v is not None and v == "":
+            raise ValueError("replacement 不能为空;须提供恰好一个 NFC 字素簇")
+        return v
+
+    @model_validator(mode="after")
+    def _exactly_one_choice(self) -> "Decision":
+        if (self.source is None) == (self.replacement is None):
+            raise ValueError("每项 decision 必须且只能提供 source 或 replacement 之一")
+        return self
+
+
+class AdjudicateRequest(AnchoredReconcileRequest):
+    """三段文本、可选锚点与待校验的人工裁决列表。"""
+
+    decisions: list[Decision] = Field(
+        default_factory=list,
+        description="人工裁决列表;全部有效才生效,任一项失效返回 409 且无部分结果",
+    )
+
+
+class Audit(BaseModel):
+    """单项裁决的审计记录。"""
+
+    signature: list[int | None] = Field(
+        ..., description="被裁决列的三来源原始位置签名(空位为 null)"
+    )
+    original: list[str | None] = Field(
+        ..., description="裁决前该列三个来源的原始字素(空位为 null)"
+    )
+    adopted: str = Field(..., description="裁决采用的字素簇")
+    method: str = Field(
+        ...,
+        description="裁决方式:source:0/source:1/source:2 表示采用某来源字素,replacement 表示人工替换",
+    )
+
+
+class AdjudicateResponse(AnchoredReconcileResponse):
+    uncertain: list[UncertainColumn] = Field(..., description="尚未裁决的 uncertain 列")
+    audits: list[Audit] = Field(..., description="本次生效裁决的审计项,顺序与请求 decisions 一致")

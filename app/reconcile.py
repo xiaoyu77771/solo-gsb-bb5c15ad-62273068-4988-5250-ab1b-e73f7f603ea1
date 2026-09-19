@@ -221,3 +221,103 @@ def reconcile_anchored(
         total_cost += column_cost(g)
         start = (i + 1, j + 1, k + 1)
     return _build_result(total_cost, columns, anchored)
+
+
+class AdjudicationConflict(Exception):
+    """一批裁决中存在失效项;conflicts 收集全部原因,保证不产生部分结果。"""
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        super().__init__(f"{len(conflicts)} 项裁决失效")
+
+
+def adjudicate(
+    reconciled: dict,
+    decisions: list[tuple[tuple, str, object]],
+) -> dict:
+    """对已有对齐结果施加人工裁决。
+
+    每项 decision 为 (signature, kind, value):
+      - signature 为三来源原位置元组 (p0, p1, p2),空位来源记 None,与对齐列
+        sources 中的 position 三元组逐位相等即视为同一列——按原始坐标而非列
+        序号定位,列序变化不会使裁决落到其他位置;
+      - kind="source" 时 value 为来源下标 0/1/2,采用该列该来源的非空字素;
+      - kind="replacement" 时 value 为一个 NFC 字素簇,直接作为采用值。
+
+    重算对齐后一次性校验全部裁决:目标列须存在、须仍为 uncertain、签名不得
+    重复、来源选择不得指向空位。任一失效即抛 AdjudicationConflict(收集全部
+    冲突),不产出部分结果。成功返回裁决后的完整结果:consensus 替换为裁决
+    文本,uncertain 仅保留未裁决列,并附 audits 审计项(签名、原字素、采用
+    值、方式),顺序与 decisions 一致。
+    """
+    columns = reconciled["columns"]
+    by_signature: dict[tuple, int] = {}
+    for col in columns:
+        signature = tuple(s["position"] for s in col["sources"])
+        by_signature.setdefault(signature, col["index"])
+    uncertain_indices = {u["column"] for u in reconciled["uncertain"]}
+
+    conflicts: list[dict] = []
+    seen: set[tuple] = set()
+    resolved: list[tuple] = []
+    for di, (signature, kind, value) in enumerate(decisions):
+        reasons: list[str] = []
+        if signature in seen:
+            reasons.append("duplicate")
+        seen.add(signature)
+        col_idx = by_signature.get(signature)
+        if col_idx is None:
+            reasons.append("column_not_found")
+        else:
+            if col_idx not in uncertain_indices:
+                reasons.append("not_uncertain")
+            if kind == "source":
+                if columns[col_idx]["sources"][value]["grapheme"] is None:
+                    reasons.append("empty_source")
+        if reasons:
+            conflicts.append(
+                {"decision": di, "signature": list(signature), "reasons": reasons}
+            )
+            continue
+        col = columns[col_idx]
+        if kind == "source":
+            adopted = col["sources"][value]["grapheme"]
+            method = f"source:{value}"
+        else:
+            adopted = value
+            method = "replacement"
+        original = [s["grapheme"] for s in col["sources"]]
+        resolved.append((col_idx, signature, original, adopted, method))
+
+    if conflicts:
+        raise AdjudicationConflict(conflicts)
+
+    adopted_by_index = {col_idx: adopted for col_idx, _, _, adopted, _ in resolved}
+    new_columns = []
+    consensus_chars = []
+    for col in columns:
+        new_col = dict(col)
+        if col["index"] in adopted_by_index:
+            new_col["consensus"] = adopted_by_index[col["index"]]
+        consensus_chars.append(new_col["consensus"])
+        new_columns.append(new_col)
+
+    remaining_uncertain = [
+        u for u in reconciled["uncertain"] if u["column"] not in adopted_by_index
+    ]
+    audits = [
+        {
+            "signature": list(signature),
+            "original": original,
+            "adopted": adopted,
+            "method": method,
+        }
+        for _, signature, original, adopted, method in resolved
+    ]
+    return {
+        **reconciled,
+        "consensus": "".join(consensus_chars),
+        "columns": new_columns,
+        "uncertain": remaining_uncertain,
+        "audits": audits,
+    }
