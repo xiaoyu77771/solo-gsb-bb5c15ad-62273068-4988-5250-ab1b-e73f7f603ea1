@@ -429,3 +429,223 @@ def test_worst_case_performance():
     elapsed = time.perf_counter() - start
     assert result["total_cost"] > 0
     assert elapsed < 10, f"120x120x120 对齐耗时 {elapsed:.1f}s"
+
+
+# ---------------------------------------------------------------- 人工裁决
+
+ADJ_TEXTS = ["甲丙", "甲丁", "甲乙"]  # 列 1 (丙/丁/乙, 位置 [1,1,1]) 为 uncertain
+
+
+def _adjudicate(payload):
+    return client.post("/reconcile/adjudicate", json=payload)
+
+
+def test_adjudicate_by_source():
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [1, 1, 1], "source": 0}]}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus"] == "甲丙"
+    assert body["uncertain"] == []
+    assert body["audit"] == [
+        {
+            "signature": [1, 1, 1],
+            "column": 1,
+            "original": "�",
+            "adopted": "丙",
+            "method": "source",
+            "source": 0,
+        }
+    ]
+
+
+def test_adjudicate_by_replacement():
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [1, 1, 1], "replacement": "乙"}]}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus"] == "甲乙"
+    assert body["audit"][0]["method"] == "replacement"
+    assert body["audit"][0]["source"] is None
+    assert body["audit"][0]["adopted"] == "乙"
+
+
+def test_adjudicate_replacement_normalized_to_nfc():
+    nfd = unicodedata.normalize("NFD", "é")
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [1, 1, 1], "replacement": nfd}]}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["audit"][0]["adopted"] == unicodedata.normalize("NFC", "é")
+
+
+def test_adjudicate_replacement_grapheme_cluster():
+    family = "👨‍👩‍👧‍👦"  # 多码点但单字素簇,合法
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [1, 1, 1], "replacement": family}]}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["consensus"] == "甲" + family
+
+
+def test_adjudicate_multiple_decisions_applied_in_order():
+    resp = _adjudicate(
+        {
+            "texts": ["甲丙戊", "甲丁己", "甲乙庚"],  # 列 1、2 均 uncertain
+            "decisions": [
+                {"positions": [2, 2, 2], "replacement": "庚"},
+                {"positions": [1, 1, 1], "source": 1},
+            ],
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus"] == "甲丁庚"
+    assert body["uncertain"] == []
+    # 审计项顺序与请求 decisions 一致
+    assert [a["column"] for a in body["audit"]] == [2, 1]
+    assert [a["adopted"] for a in body["audit"]] == ["庚", "丁"]
+
+
+def test_adjudicate_signature_pins_column_regardless_of_order():
+    # 只裁决第二个 uncertain 列:坐标签名定位,不得落到前一列
+    resp = _adjudicate(
+        {
+            "texts": ["甲丙戊", "甲丁己", "甲乙庚"],
+            "decisions": [{"positions": [2, 2, 2], "source": 0}],
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus"] == "甲�戊"
+    assert [u["column"] for u in body["uncertain"]] == [1]
+    assert body["audit"][0]["column"] == 2
+
+
+def test_adjudicate_empty_decisions_matches_plain():
+    resp = _adjudicate({"texts": ADJ_TEXTS})
+    assert resp.status_code == 200
+    body = resp.json()
+    plain = client.post("/reconcile", json={"texts": ADJ_TEXTS}).json()
+    assert body["consensus"] == plain["consensus"]
+    assert body["uncertain"] == plain["uncertain"]
+    assert body["audit"] == []
+
+
+def test_adjudicate_with_anchors():
+    # 锚点强制三个互异字素同列(uncertain),再按坐标签名裁决该列
+    resp = _adjudicate(
+        {
+            "texts": ["甲", "乙", "丙"],
+            "anchors": [{"positions": [0, 0, 0]}],
+            "decisions": [{"positions": [0, 0, 0], "source": 1}],
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["consensus"] == "乙"
+    assert body["uncertain"] == []
+    assert body["audit"][0]["signature"] == [0, 0, 0]
+
+
+def test_adjudicate_gap_in_signature():
+    # 列 1 为 (乙/丙/空位):签名含 null,source 不得指向空位
+    texts = ["甲乙", "甲丙", "甲"]
+    ok = _adjudicate({"texts": texts, "decisions": [{"positions": [1, 1, None], "source": 0}]})
+    assert ok.status_code == 200
+    assert ok.json()["consensus"] == "甲乙"
+    gap = _adjudicate({"texts": texts, "decisions": [{"positions": [1, 1, None], "source": 2}]})
+    assert gap.status_code == 409
+
+
+def test_adjudicate_rejects_unknown_signature():
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [0, 1, 1], "source": 0}]}
+    )
+    assert resp.status_code == 409
+
+
+def test_adjudicate_rejects_certain_column():
+    # 列 0 已达成共识(甲),不是 uncertain
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [0, 0, 0], "source": 0}]}
+    )
+    assert resp.status_code == 409
+
+
+def test_adjudicate_rejects_duplicate_decisions():
+    resp = _adjudicate(
+        {
+            "texts": ADJ_TEXTS,
+            "decisions": [
+                {"positions": [1, 1, 1], "source": 0},
+                {"positions": [1, 1, 1], "source": 1},
+            ],
+        }
+    )
+    assert resp.status_code == 409
+
+
+def test_adjudicate_all_or_nothing():
+    # 第一项有效、第二项失效:整体 409,不产出部分结果
+    resp = _adjudicate(
+        {
+            "texts": ["甲丙戊", "甲丁己", "甲乙庚"],
+            "decisions": [
+                {"positions": [1, 1, 1], "source": 0},
+                {"positions": [9, 9, 9], "source": 0},
+            ],
+        }
+    )
+    assert resp.status_code == 409
+    assert "consensus" not in resp.json()
+
+
+def test_adjudicate_rejects_invalid_decision_shape():
+    base = {"texts": ADJ_TEXTS}
+
+    def post(decision):
+        return _adjudicate({**base, "decisions": [decision]})
+
+    # source 与 replacement 二缺一:同时提供或都不提供均 422
+    assert post({"positions": [1, 1, 1]}).status_code == 422
+    assert post({"positions": [1, 1, 1], "source": 0, "replacement": "乙"}).status_code == 422
+    # source 取值越界
+    assert post({"positions": [1, 1, 1], "source": 3}).status_code == 422
+    # replacement 须为恰好一个字素簇
+    assert post({"positions": [1, 1, 1], "replacement": ""}).status_code == 422
+    assert post({"positions": [1, 1, 1], "replacement": "甲乙"}).status_code == 422
+    # 坐标签名长度须为 3
+    assert post({"positions": [1, 1], "source": 0}).status_code == 422
+    assert post({"positions": [1, 1, 1, 1], "source": 0}).status_code == 422
+
+
+def test_adjudicate_validates_texts_and_anchors():
+    # 文本段数、字素上限与锚点规则沿用现有校验(422)
+    assert _adjudicate({"texts": ["甲", "乙"]}).status_code == 422
+    assert _adjudicate({"texts": ["字" * 121, "", ""]}).status_code == 422
+    assert (
+        _adjudicate(
+            {"texts": ["甲", "甲", "甲"], "anchors": [{"positions": [0, 0, 1]}]}
+        ).status_code
+        == 422
+    )
+
+
+def test_adjudicate_response_shape():
+    resp = _adjudicate(
+        {"texts": ADJ_TEXTS, "decisions": [{"positions": [1, 1, 1], "source": 2}]}
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"consensus", "uncertain", "audit"}
+    assert set(body["audit"][0]) == {
+        "signature",
+        "column",
+        "original",
+        "adopted",
+        "method",
+        "source",
+    }

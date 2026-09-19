@@ -1,7 +1,10 @@
 """请求/响应模型。"""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+import unicodedata
+
+import grapheme
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class ReconcileRequest(BaseModel):
@@ -76,3 +79,80 @@ class AnchoredColumn(Column):
 
 class AnchoredReconcileResponse(ReconcileResponse):
     columns: list[AnchoredColumn] = Field(..., description="对齐列(含 anchored 标记)")
+
+
+class Decision(BaseModel):
+    """一项人工裁决:以坐标签名定位一个 uncertain 列,并指定采用值。
+
+    定位坐标为该列三个来源字素的原位置三元组(空位为 null);采用值
+    二选一:source 选中该列某个非空来源字素,replacement 直接给出
+    恰好一个字素簇(服务端 NFC 规范化后校验)。
+    """
+
+    positions: list[int | None] = Field(
+        ...,
+        description="恰好三个原位置(0 起始),依次为 texts[0/1/2] 中的字素簇下标,空位为 null",
+    )
+    source: int | None = Field(
+        default=None, description="采用该列某个非空来源的字素:0/1/2 对应 texts[0/1/2]"
+    )
+    replacement: str | None = Field(
+        default=None, description="替换字素,NFC 规范化后须为恰好一个字素簇"
+    )
+
+    @field_validator("positions")
+    @classmethod
+    def _exactly_three(cls, v: list[int | None]) -> list[int | None]:
+        if len(v) != 3:
+            raise ValueError("坐标签名必须恰好给出三个位置(positions 长度须为 3)")
+        return v
+
+    @field_validator("source")
+    @classmethod
+    def _valid_source(cls, v: int | None) -> int | None:
+        if v is not None and v not in (0, 1, 2):
+            raise ValueError("source 只能是 0、1 或 2")
+        return v
+
+    @field_validator("replacement")
+    @classmethod
+    def _single_cluster(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        normalized = unicodedata.normalize("NFC", v)
+        clusters = list(grapheme.graphemes(normalized))
+        if len(clusters) != 1:
+            raise ValueError("replacement 须为恰好一个字素簇(NFC 规范化后)")
+        return normalized
+
+    @model_validator(mode="after")
+    def _exactly_one_value(self) -> "Decision":
+        if (self.source is None) == (self.replacement is None):
+            raise ValueError("source 与 replacement 必须且只能提供一个")
+        return self
+
+
+class AdjudicateRequest(AnchoredReconcileRequest):
+    """三段文本、可选锚点,加人工裁决列表。"""
+
+    decisions: list[Decision] = Field(
+        default_factory=list,
+        description="人工裁决列表;全部有效才一次性应用,任一项失效返回 409",
+    )
+
+
+class AuditEntry(BaseModel):
+    """一条裁决审计记录。"""
+
+    signature: list[int | None] = Field(..., description="定位列的坐标签名(三个原位置,空位为 null)")
+    column: int = Field(..., description="裁决命中的列序号")
+    original: str = Field(..., description="裁决前列的共识字素(恒为 �)")
+    adopted: str = Field(..., description="裁决采用的字素")
+    method: str = Field(..., description="裁决方式:source(采用来源字素)或 replacement(替换字素)")
+    source: int | None = Field(default=None, description="method 为 source 时采用的来源编号,否则为 null")
+
+
+class AdjudicateResponse(BaseModel):
+    consensus: str = Field(..., description="裁决后的完整文本")
+    uncertain: list[UncertainColumn] = Field(..., description="仍未裁决的列及各来源字素与原位置")
+    audit: list[AuditEntry] = Field(..., description="已应用裁决的审计项,顺序与请求 decisions 一致")

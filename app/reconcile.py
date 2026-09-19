@@ -221,3 +221,79 @@ def reconcile_anchored(
         total_cost += column_cost(g)
         start = (i + 1, j + 1, k + 1)
     return _build_result(total_cost, columns, anchored)
+
+
+class AdjudicationError(ValueError):
+    """裁决校验失败;message 为中文原因,由 API 层转为 409。"""
+
+
+def adjudicate(
+    a: list[str],
+    b: list[str],
+    c: list[str],
+    anchors: list[tuple[int, int, int]],
+    decisions: list[dict],
+) -> dict:
+    """重算对齐后一次性校验并应用全部人工裁决。
+
+    每项 decision 以坐标签名 positions(三个来源字素的原位置,空位为 None)
+    定位一个 uncertain 列,并以 source(采用该列某个非空来源字素)或
+    replacement(替换字素,调用方须已 NFC 规范化并保证为单个字素簇)给出
+    采用值。校验全部通过才应用;任一项失效抛 AdjudicationError,不产生
+    部分结果。返回裁决后的完整文本、未裁决列与审计项。
+    """
+    result = reconcile_anchored(a, b, c, anchors)
+
+    # 以坐标签名索引全部列:裁决按签名定位,与列序无关
+    by_signature: dict[tuple, dict] = {}
+    for column in result["columns"]:
+        signature = tuple(s["position"] for s in column["sources"])
+        by_signature[signature] = column
+
+    seen: set[tuple] = set()
+    planned: list[tuple[dict, dict, str, str]] = []  # (decision, column, adopted, method)
+    for idx, decision in enumerate(decisions):
+        signature = tuple(decision["positions"])
+        if signature in seen:
+            raise AdjudicationError(f"decisions[{idx}] 与之前的裁决重复定位同一列")
+        seen.add(signature)
+        column = by_signature.get(signature)
+        if column is None:
+            raise AdjudicationError(
+                f"decisions[{idx}] 的坐标签名 {list(signature)} 未命中任何对齐列"
+            )
+        if column["consensus"] != REPLACEMENT:
+            raise AdjudicationError(
+                f"decisions[{idx}] 命中的列 {column['index']} 已达成共识,不是 uncertain 列"
+            )
+        if decision["source"] is not None:
+            source = decision["source"]
+            if column["sources"][source]["grapheme"] is None:
+                raise AdjudicationError(
+                    f"decisions[{idx}] 的 source={source} 指向空位,该来源在此列无字素"
+                )
+            planned.append((decision, column, column["sources"][source]["grapheme"], "source"))
+        else:
+            planned.append((decision, column, decision["replacement"], "replacement"))
+
+    # 全部校验通过,一次性应用
+    consensus_chars = [column["consensus"] for column in result["columns"]]
+    audit = []
+    for decision, column, adopted, method in planned:
+        consensus_chars[column["index"]] = adopted
+        audit.append(
+            {
+                "signature": list(tuple(decision["positions"])),
+                "column": column["index"],
+                "original": column["consensus"],
+                "adopted": adopted,
+                "method": method,
+                "source": decision["source"] if method == "source" else None,
+            }
+        )
+    adjudicated = {column["index"] for _, column, _, _ in planned}
+    return {
+        "consensus": "".join(consensus_chars),
+        "uncertain": [u for u in result["uncertain"] if u["column"] not in adjudicated],
+        "audit": audit,
+    }

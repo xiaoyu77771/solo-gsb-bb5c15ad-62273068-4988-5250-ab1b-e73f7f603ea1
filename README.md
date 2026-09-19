@@ -130,13 +130,57 @@ curl -X POST http://localhost:8000/reconcile/anchored \
 }
 ```
 
+### `POST /reconcile/adjudicate`
+
+在 `/reconcile/anchored` 的基础上接受**人工裁决**:服务端重算对齐后,一次性校验并应用全部裁决,返回裁决后的完整文本、仍未裁决的列与审计项。`anchors` 可省略;每项裁决以**坐标签名**(该列三个来源字素的原位置,空位为 `null`)定位一个 `uncertain` 列——签名与列序无关,列序变化不会导致裁决落到其他位置。
+
+每项裁决二选一给出采用值:
+
+- `source`:采用该列某个**非空**来源的字素(`0`/`1`/`2` 对应 `texts[0]`/`texts[1]`/`texts[2]`);
+- `replacement`:直接给出替换字素,NFC 规范化后须为**恰好一个字素簇**(如 `👨‍👩‍👧‍👦` 合法)。
+
+校验规则:目标列必须存在且仍为 `uncertain`、裁决之间不得重复定位同一列、`source` 不得指向空位。任一项失效即整体返回 **409**,不产出部分结果;格式错误(文本段数、字素上限、锚点、裁决结构)返回 422。
+
+```json
+{
+  "texts": ["甲丙", "甲丁", "甲乙"],
+  "decisions": [{"positions": [1, 1, 1], "source": 0}]
+}
+```
+
+```bash
+curl -X POST http://localhost:8000/reconcile/adjudicate \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["甲丙", "甲丁", "甲乙"], "decisions": [{"positions": [1, 1, 1], "source": 0}]}'
+```
+
+响应示例:
+
+```json
+{
+  "consensus": "甲丙",
+  "uncertain": [],
+  "audit": [
+    {
+      "signature": [1, 1, 1],
+      "column": 1,
+      "original": "�",
+      "adopted": "丙",
+      "method": "source",
+      "source": 0
+    }
+  ]
+}
+```
+
 ## 对齐规则
 
 - 每列可消费任意非空来源组合,以位掩码表示:bit0/1/2 分别对应 `texts[0]/texts[1]/texts[2]`(如 `mask=5` 表示该列消费来源 0 与 2)。
 - 单列成本:两两配对中,字符不等或字符与空位配对各计 1,空位与空位计 0;总成本为各列之和,取全局最小。
 - 平局时依次偏好:消费来源数更多的掩码、位掩码更小的掩码(优先级 `7 > 3 > 5 > 6 > 1 > 2 > 4`)。
 - 共识:某列至少两份相同非空字素时写入该字素,否则写入 `�`,并在 `uncertain` 中列出该列各来源的字素与原位置(0 起始,空位为 `null`)。
-- 锚点(仅 `/reconcile/anchored`):每个锚点强制三份文本指定位置的字素同列(掩码 7);锚点把序列切分为若干区间,各区间独立求全局最小成本后拼接,锚点列照常计入成本与共识。
+- 锚点(仅 `/reconcile/anchored` 与 `/reconcile/adjudicate`):每个锚点强制三份文本指定位置的字素同列(掩码 7);锚点把序列切分为若干区间,各区间独立求全局最小成本后拼接,锚点列照常计入成本与共识。
+- 人工裁决(仅 `/reconcile/adjudicate`):每项裁决以坐标签名定位一个 `uncertain` 列,采用某个非空来源字素(`source`)或替换字素(`replacement`);全部裁决校验通过才一次性应用,任一项失效返回 409。响应含裁决后的完整 `consensus`、未裁决列 `uncertain` 与审计项 `audit`(坐标签名、原字素、采用值与方式)。
 
 ## 本地开发
 

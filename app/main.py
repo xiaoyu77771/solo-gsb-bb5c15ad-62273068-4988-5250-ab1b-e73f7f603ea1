@@ -6,8 +6,10 @@ import unicodedata
 import grapheme
 from fastapi import FastAPI, HTTPException
 
-from .reconcile import reconcile, reconcile_anchored
+from .reconcile import AdjudicationError, adjudicate, reconcile, reconcile_anchored
 from .schemas import (
+    AdjudicateRequest,
+    AdjudicateResponse,
     AnchoredReconcileRequest,
     AnchoredReconcileResponse,
     ReconcileRequest,
@@ -18,8 +20,8 @@ MAX_GRAPHEMES = 120
 
 app = FastAPI(
     title="抄本核对 API",
-    version="1.1.0",
-    description="接收三段抄录文本,NFC 规范化后做三维全局动态规划对齐,输出共识文本、对齐列与总成本;支持锚点强制对齐。",
+    version="1.2.0",
+    description="接收三段抄录文本,NFC 规范化后做三维全局动态规划对齐,输出共识文本、对齐列与总成本;支持锚点强制对齐与人工裁决。",
 )
 
 
@@ -38,6 +40,30 @@ def _to_clusters(texts: list[str]) -> list[list[str]]:
     return seqs
 
 
+def _validate_anchors(
+    anchors: list, seqs: list[list[str]]
+) -> list[tuple[int, int, int]]:
+    """校验锚点不越界且各来源位置严格递增,返回三元组列表;违反时抛 422。"""
+    validated: list[tuple[int, int, int]] = []
+    prev = (-1, -1, -1)
+    for idx, anchor in enumerate(anchors):
+        pos = tuple(anchor.positions)
+        for s in range(3):
+            if not 0 <= pos[s] < len(seqs[s]):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"anchors[{idx}].positions[{s}]={pos[s]} 越界:texts[{s}] 共 {len(seqs[s])} 个字素簇",
+                )
+            if pos[s] <= prev[s]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"anchors[{idx}].positions[{s}]={pos[s]} 未严格递增(上一锚点为 {prev[s]}),锚点不得重复或回退",
+                )
+        validated.append(pos)
+        prev = pos
+    return validated
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -51,21 +77,15 @@ def post_reconcile(req: ReconcileRequest) -> dict:
 @app.post("/reconcile/anchored", response_model=AnchoredReconcileResponse)
 def post_reconcile_anchored(req: AnchoredReconcileRequest) -> dict:
     seqs = _to_clusters(req.texts)
-    anchors: list[tuple[int, int, int]] = []
-    prev = (-1, -1, -1)
-    for idx, anchor in enumerate(req.anchors):
-        pos = tuple(anchor.positions)
-        for s in range(3):
-            if not 0 <= pos[s] < len(seqs[s]):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"anchors[{idx}].positions[{s}]={pos[s]} 越界:texts[{s}] 共 {len(seqs[s])} 个字素簇",
-                )
-            if pos[s] <= prev[s]:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"anchors[{idx}].positions[{s}]={pos[s]} 未严格递增(上一锚点为 {prev[s]}),锚点不得重复或回退",
-                )
-        anchors.append(pos)
-        prev = pos
-    return reconcile_anchored(*seqs, anchors)
+    return reconcile_anchored(*seqs, _validate_anchors(req.anchors, seqs))
+
+
+@app.post("/reconcile/adjudicate", response_model=AdjudicateResponse)
+def post_reconcile_adjudicate(req: AdjudicateRequest) -> dict:
+    seqs = _to_clusters(req.texts)
+    anchors = _validate_anchors(req.anchors, seqs)
+    decisions = [d.model_dump() for d in req.decisions]
+    try:
+        return adjudicate(*seqs, anchors, decisions)
+    except AdjudicationError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
